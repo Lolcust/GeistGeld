@@ -749,7 +749,7 @@ public:
     void PushVersion()
     {
         /// when NTP implemented, change to just nTime = GetAdjustedTime()
-        int64 nTime = (fInbound ? GetAdjustedTime() : GetTime());
+        int64 nTime = ((fInbound || fNTPSynced) ? GetAdjustedTime() : GetTime());
         CAddress addrYou = (fUseProxy ? CAddress("0.0.0.0") : addr);
         CAddress addrMe = (fUseProxy ? CAddress("0.0.0.0") : addrLocalHost);
         RAND_bytes((unsigned char*)&nLocalHostNonce, sizeof(nLocalHostNonce));

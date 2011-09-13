@@ -175,6 +175,8 @@ extern bool fTestNet_config;
 extern bool fNoListen;
 extern bool fLogTimestamps;
 extern unsigned char uAddressVersion;
+extern int nTimeNTPOffset;
+extern bool fNTPSynced;
 
 void RandAddSeed();
 void RandAddSeedPerfmon();

@@ -11,11 +11,8 @@
 
 #ifdef __WXMSW__
 #include <string.h>
-// This file can be downloaded as a part of the Windows Platform SDK
-// and is required for Bitcoin binaries to work properly on versions
-// of Windows before XP.  If you are doing builds of Bitcoin for
-// public release, you should uncomment this line.
-//#include <WSPiApi.h>
+// Sorry, XP and up only.
+#include <ws2tcpip.h>
 #endif
 
 #ifdef USE_UPNP
@@ -1147,6 +1144,188 @@ void MapPort(bool fMapPort)
 
 
 
+static boost::posix_time::time_duration getNTPOffset(SOCKET hSocket)
+{
+    using namespace boost::posix_time;
+
+    const unsigned char sendbuffer[48] = {
+        0x1b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    ptime sendtime = microsec_clock::universal_time();
+    if (send(hSocket, (char*)sendbuffer, 48, 0) != 48)
+    {
+        printf("NTP send() failed\n");
+        return time_duration(not_a_date_time);
+    }
+
+    fd_set fdset;
+    FD_ZERO(&fdset);
+    FD_SET(hSocket, &fdset);
+    struct timeval t = {3, 0};
+    int n_readable = select(hSocket+1, &fdset, NULL, NULL, &t);
+    if (n_readable <= 0)
+    {
+        printf("NTP timeout\n");
+        return time_duration(not_a_date_time);
+    }
+
+    unsigned char recvbuffer[48];
+    if (recv(hSocket, (char*)recvbuffer, 48, 0) != 48)
+    {
+        printf("NTP recv() failed\n");
+        return time_duration(not_a_date_time);
+    }
+    ptime recvtime = microsec_clock::universal_time();
+
+    time_duration half_roundtrip = (recvtime - sendtime) / 2;
+
+    typedef boost::uint32_t u32;
+    u32 iPart(
+        static_cast<u32>(recvbuffer[40]) << 24
+        | static_cast<u32>(recvbuffer[41]) << 16
+        | static_cast<u32>(recvbuffer[42]) << 8
+        | static_cast<u32>(recvbuffer[43])
+    );
+    u32 fPart(
+        static_cast<u32>(recvbuffer[44]) << 24
+        | static_cast<u32>(recvbuffer[45]) << 16
+        | static_cast<u32>(recvbuffer[46]) << 8
+        | static_cast<u32>(recvbuffer[47])
+    );
+
+    ptime pt(
+        boost::gregorian::date(1900,1,1),
+        milliseconds(iPart * 1.0E3 + fPart * 1.0E3 / 0x100000000ULL )
+    );
+    ptime servertime = pt + half_roundtrip;
+    return (servertime - recvtime);
+}
+
+static void ThreadNTPSync2(void* parg)
+{
+    printf("ThreadNTPSync started\n");
+
+    //look up a bunch of NTP servers
+    struct addrinfo* ntphosts;
+    int ai_err = getaddrinfo("pool.ntp.org", "123", NULL, &ntphosts);
+    if (ai_err != 0)
+    {
+        printf("NTP name lookup failed: %s\n", gai_strerror(ai_err));
+        return;
+    }
+    if (! ntphosts)
+    {
+        printf("NTP name lookup returned no results\n");
+        return;
+    }
+    vector<struct sockaddr> ntpaddrs;
+    for (struct addrinfo* tmpaddr = ntphosts; tmpaddr; tmpaddr = tmpaddr->ai_next)
+    {
+        if (tmpaddr->ai_family == AF_INET)
+        {
+            struct sockaddr toadd;
+            memcpy(&toadd, tmpaddr->ai_addr, sizeof(sockaddr));
+            ntpaddrs.push_back(toadd);
+        }
+    }
+    freeaddrinfo(ntphosts);
+    if (ntpaddrs.empty())
+    {
+        printf("NTP name lookup returned no usable results\n");
+        return;
+    }
+
+    SOCKET hSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (hSocket == INVALID_SOCKET)
+    {
+        printf("NTP socket() failed\n");
+        return;
+    }
+    
+    vector<struct sockaddr>::iterator ithost = ntpaddrs.begin();
+    if (connect(hSocket, &(*ithost), sizeof(sockaddr)))
+    {
+        printf("NTP connect() failed\n");
+        return;
+    }
+
+    loop {
+        if (fShutdown)
+            break;
+
+        boost::posix_time::time_duration offset = getNTPOffset(hSocket);
+
+        if (offset.is_not_a_date_time())
+        {
+            // Something went wrong, try a different server in 5 seconds
+            if(++ithost == ntpaddrs.end())
+                 ithost = ntpaddrs.begin();
+            if (connect(hSocket, &(*ithost), sizeof(sockaddr)))
+            {
+                printf("NTP connect() failed\n");
+                return;
+            }
+            Sleep(5000);
+            continue;
+        }
+
+        printf("NTP sync, offset %+li ms\n", offset.total_milliseconds());
+
+        // Show a warning if NTP time is off more than 1 hour
+        if (abs(offset.total_seconds()) >= 70 * 60)
+        {
+            string strMessage = _("Warning: Please check that your computer's date and time are correct.  If your clock is wrong Bitcoin will not work properly.");
+            strMiscWarning = strMessage;
+            printf("*** %s\n", strMessage.c_str());
+            boost::thread(boost::bind(ThreadSafeMessageBox, strMessage+" ", string("Bitcoin"), wxOK | wxICON_EXCLAMATION, (wxWindow*)NULL, -1, -1));
+        }
+        else
+        {
+            int ntpoffset = time_t(offset.total_seconds());
+
+            // This should be reasonably threadsafe on any platform we run on
+            nTimeNTPOffset = ntpoffset;
+            fNTPSynced = true;
+        }
+
+        // Sleep for about 1 hour
+        for(int i = 0; i < 60 * 60; i++)
+        {
+            if (fShutdown)
+                break;
+            Sleep(1000);
+        }
+    }
+    closesocket(hSocket);
+}
+
+static void ThreadNTPSync(void* parg)
+{
+    IMPLEMENT_RANDOMIZE_STACK(ThreadNTPSync(parg));
+    try
+    {
+        vnThreadsRunning[6]++;
+        ThreadNTPSync2(parg);
+        vnThreadsRunning[6]--;
+    }
+    catch (std::exception& e) {
+        vnThreadsRunning[6]--;
+        PrintException(&e, "ThreadNTPSync()");
+    } catch (...) {
+        vnThreadsRunning[6]--;
+        PrintException(NULL, "ThreadNTPSync()");
+    }
+    printf("ThreadNTPSync exiting\n");
+}
+
+
+
+
+
+
+
+
 
 static const char *strDNSSeed[] = {
     "bitseed.xf2.org",
@@ -1250,6 +1429,22 @@ void ThreadOpenConnections(void* parg)
 void ThreadOpenConnections2(void* parg)
 {
     printf("ThreadOpenConnections started\n");
+
+    if (GetBoolArg("-ntp"))
+    {
+        // Wait up to 20 seconds for initial NTP sync
+        int ntpwaits;
+        for (ntpwaits = 0; ntpwaits < 20; ntpwaits++)
+        {
+            if(fNTPSynced)
+                break;
+            Sleep(1000);
+        }
+        if (ntpwaits == 20)
+        {
+            printf("ThreadOpenConnections wait for NTP sync timed out\n");
+        }
+    }
 
     // Connect to specific addresses
     if (mapArgs.count("-connect"))
@@ -1704,6 +1899,11 @@ void StartNode(void* parg)
     if (fHaveUPnP)
         MapPort(fUseUPnP);
 
+    //get time offset from NTP server
+    if (GetBoolArg("-ntp"))
+        if (!CreateThread(ThreadNTPSync, NULL))
+            printf("Error: CreateThread(ThreadNTPSync) failed\n");
+
     // Get addresses from IRC and advertise ours
     if (!CreateThread(ThreadIRCSeed, NULL))
         printf("Error: CreateThread(ThreadIRCSeed) failed\n");
@@ -1733,6 +1933,7 @@ bool StopNode()
 #ifdef USE_UPNP
         || vnThreadsRunning[5] > 0
 #endif
+        || vnThreadsRunning[6] > 0
     )
     {
         if (GetTime() - nStart > 20)
@@ -1745,6 +1946,7 @@ bool StopNode()
     if (vnThreadsRunning[3] > 0) printf("ThreadBitcoinMiner still running\n");
     if (vnThreadsRunning[4] > 0) printf("ThreadRPCServer still running\n");
     if (fHaveUPnP && vnThreadsRunning[5] > 0) printf("ThreadMapPort still running\n");
+    if (vnThreadsRunning[6] > 0) printf("ThreadNTPSync still running\n");
     while (vnThreadsRunning[2] > 0 || vnThreadsRunning[4] > 0)
         Sleep(20);
     Sleep(50);
